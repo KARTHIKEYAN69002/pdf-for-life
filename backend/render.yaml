@@ -1,0 +1,12 @@
+services:
+  - type: web
+    name: pdf-for-life-api
+    env: node
+    plan: free
+    buildCommand: npm install
+    startCommand: node server.js
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: FRONTEND_URL
+        fromInput: true
