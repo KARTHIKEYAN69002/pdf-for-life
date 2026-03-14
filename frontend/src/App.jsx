@@ -1,4 +1,4 @@
-import React from 'react';
+import React, { useEffect, useState } from 'react';
 import { BrowserRouter as Router, Routes, Route } from 'react-router-dom';
 import { ThemeProvider } from './context/ThemeContext';
 import Header from './components/Header';
@@ -15,6 +15,46 @@ import WordToPDF from './pages/WordToPDF';
 import PDFToWord from './pages/PDFToWord';
 import './index.css';
 
+const API_BASE = process.env.REACT_APP_API_BASE || 'http://localhost:5000';
+
+function WakeBanner() {
+  const [waking, setWaking] = useState(false);
+  const [ready, setReady] = useState(false);
+
+  useEffect(() => {
+    let done = false;
+    const wake = async () => {
+      try {
+        const res = await fetch(`${API_BASE}/api/health`, { signal: AbortSignal.timeout(5000) });
+        if (res.ok) { done = true; setReady(true); setWaking(false); return; }
+      } catch {}
+      if (!done) setWaking(true);
+      // retry every 4 seconds until awake
+      const interval = setInterval(async () => {
+        try {
+          const res = await fetch(`${API_BASE}/api/health`, { signal: AbortSignal.timeout(5000) });
+          if (res.ok) { clearInterval(interval); setReady(true); setWaking(false); }
+        } catch {}
+      }, 4000);
+      setTimeout(() => clearInterval(interval), 120000);
+    };
+    wake();
+  }, []);
+
+  if (ready || !waking) return null;
+  return (
+    <div style={{
+      background: '#d97706', color: 'white',
+      padding: '10px 24px', textAlign: 'center',
+      fontSize: 13, fontWeight: 500,
+      display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 10
+    }}>
+      <span style={{ display: 'inline-block', animation: 'spin 1s linear infinite', fontSize: 16 }}>⟳</span>
+      Server is waking up — this takes ~30 seconds on first visit. Please wait…
+    </div>
+  );
+}
+
 function Footer() {
   return (
     <footer style={{
@@ -25,7 +65,7 @@ function Footer() {
       <p>PDF for Life — Free, open-source PDF tools. Files auto-deleted after 1 hour.</p>
       <p style={{ marginTop: 6 }}>
         Built with ♥ using React, Node.js & pdf-lib ·{' '}
-        <a href="https://github.com/yourusername/pdf-for-life" target="_blank" rel="noreferrer"
+        <a href="https://github.com/KARTHIKEYAN69002/pdf-for-life" target="_blank" rel="noreferrer"
           style={{ color: 'var(--accent)', textDecoration: 'none' }}>GitHub</a>
       </p>
     </footer>
@@ -37,6 +77,7 @@ export default function App() {
     <ThemeProvider>
       <Router>
         <Header />
+        <WakeBanner />
         <main>
           <Routes>
             <Route path="/" element={<Home />} />

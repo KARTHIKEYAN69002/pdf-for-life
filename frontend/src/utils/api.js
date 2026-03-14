@@ -4,7 +4,7 @@ const BASE_URL = process.env.REACT_APP_API_URL || '/api/pdf';
 
 export const api = axios.create({
   baseURL: BASE_URL,
-  timeout: 120000, // 2 min for large files
+  timeout: 300000, // 5 min to handle cold starts + large files
 });
 
 export function getDownloadUrl(path) {
