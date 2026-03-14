@@ -28,23 +28,32 @@ function saveOutput(buffer, filename) {
 }
 
 // ── MERGE ─────────────────────────────────────────────────────────────────────
-router.post('/merge', upload.array('files', 20), async (req, res) => {
+router.post('/merge', upload.array('files', 50), async (req, res) => {
   if (!req.files || req.files.length < 2) {
     return res.status(400).json({ error: 'Please upload at least 2 PDF files.' });
   }
   try {
     const merged = await PDFDocument.create();
     for (const file of req.files) {
-      const bytes = await fs.readFile(file.path);
-      const doc = await PDFDocument.load(bytes);
-      const pages = await merged.copyPages(doc, doc.getPageIndices());
-      pages.forEach(p => merged.addPage(p));
+      try {
+        const bytes = await fs.readFile(file.path);
+        const doc = await PDFDocument.load(bytes, { ignoreEncryption: true });
+        const pages = await merged.copyPages(doc, doc.getPageIndices());
+        pages.forEach(p => merged.addPage(p));
+      } catch (fileErr) {
+        // skip corrupt files, continue merging the rest
+        console.warn(`Skipping file ${file.originalname}: ${fileErr.message}`);
+      }
+    }
+    if (merged.getPageCount() === 0) {
+      await cleanupFiles(req.files);
+      return res.status(400).json({ error: 'No valid PDF pages found in uploaded files.' });
     }
     const outBytes = await merged.save();
     const filename = `merged-${uuidv4()}.pdf`;
     const url = saveOutput(outBytes, filename);
     await cleanupFiles(req.files);
-    res.json({ success: true, url, filename });
+    res.json({ success: true, url, filename, pageCount: merged.getPageCount() });
   } catch (err) {
     await cleanupFiles(req.files);
     res.status(500).json({ error: err.message });
@@ -300,47 +309,75 @@ router.post('/extract-images', upload.single('file'), async (req, res) => {
   if (!req.file) return res.status(400).json({ error: 'No file uploaded.' });
   try {
     const bytes = await fs.readFile(req.file.path);
-    const doc = await PDFDocument.load(bytes);
-    const images = [];
     let imageCount = 0;
 
-    // Extract embedded XObject images
-    const context = doc.context;
-    const refs = context.enumerateIndirectObjects();
     const zipName = `images-${uuidv4()}.zip`;
     const zipPath = path.join(tempDir, zipName);
     const output = fs.createWriteStream(zipPath);
     const archive = archiver('zip', { zlib: { level: 6 } });
     archive.pipe(output);
 
-    for (const [ref, obj] of refs) {
-      try {
-        if (obj && obj.dict) {
-          const subtype = obj.dict.get(context.obj('Subtype'));
-          if (subtype && subtype.toString() === '/Image') {
-            const filter = obj.dict.get(context.obj('Filter'));
-            let ext = 'bin';
-            let imageBytes = obj.contents;
-            if (filter) {
-              const filterStr = filter.toString();
-              if (filterStr.includes('DCTDecode')) ext = 'jpg';
-              else if (filterStr.includes('FlateDecode')) ext = 'png';
-              else if (filterStr.includes('JBIG2Decode')) ext = 'jbig2';
-              else if (filterStr.includes('JPXDecode')) ext = 'jp2';
-            }
-            if (imageBytes && imageBytes.length > 0) {
-              archive.append(Buffer.from(imageBytes), { name: `image-${++imageCount}.${ext}` });
-            }
+    // Parse raw PDF bytes to find image streams
+    // Look for inline image markers and XObject streams
+    const pdfStr = bytes.toString('binary');
+
+    // Method 1: Find JPEG images by their SOI marker (FF D8 FF)
+    let pos = 0;
+    while (pos < bytes.length - 2) {
+      if (bytes[pos] === 0xFF && bytes[pos + 1] === 0xD8 && bytes[pos + 2] === 0xFF) {
+        // Found JPEG start — find end marker FF D9
+        let end = pos + 3;
+        while (end < bytes.length - 1) {
+          if (bytes[end] === 0xFF && bytes[end + 1] === 0xD9) {
+            end += 2;
+            break;
           }
+          end++;
+        }
+        const jpegBytes = bytes.slice(pos, end);
+        if (jpegBytes.length > 500) { // skip tiny/corrupt ones
+          archive.append(jpegBytes, { name: `image-${++imageCount}.jpg` });
+        }
+        pos = end;
+      } else {
+        pos++;
+      }
+    }
+
+    // Method 2: Try pdf-lib XObject approach as fallback
+    if (imageCount === 0) {
+      try {
+        const doc = await PDFDocument.load(bytes, { ignoreEncryption: true });
+        const context = doc.context;
+        for (const [ref, obj] of context.enumerateIndirectObjects()) {
+          try {
+            if (!obj || typeof obj !== 'object') continue;
+            const dict = obj.dict;
+            if (!dict) continue;
+            const subtype = dict.get(context.obj('Subtype'));
+            if (!subtype || subtype.toString() !== '/Image') continue;
+            const contents = obj.contents;
+            if (!contents || contents.length < 100) continue;
+            const filter = dict.get(context.obj('Filter'));
+            let ext = 'png';
+            if (filter) {
+              const f = filter.toString();
+              if (f.includes('DCTDecode')) ext = 'jpg';
+              else if (f.includes('JPXDecode')) ext = 'jp2';
+            }
+            archive.append(Buffer.from(contents), { name: `image-${++imageCount}.${ext}` });
+          } catch {}
         }
       } catch {}
     }
 
     if (imageCount === 0) {
       output.destroy();
-      await fs.remove(zipPath);
+      try { await fs.remove(zipPath); } catch {}
       await cleanupFiles(req.file);
-      return res.status(404).json({ error: 'No extractable images found in this PDF.' });
+      return res.status(404).json({
+        error: 'No extractable images found. This PDF may use vector graphics only, or images may be embedded in an unsupported format.'
+      });
     }
 
     await new Promise((resolve, reject) => {
@@ -493,75 +530,81 @@ router.post('/word-to-pdf', upload.single('file'), async (req, res) => {
   if (!req.file) return res.status(400).json({ error: 'No file uploaded.' });
   try {
     const bytes = await fs.readFile(req.file.path);
-    
-    // Convert DOCX to HTML using mammoth
-    const result = await mammoth.convertToHtml({ buffer: bytes });
-    const html = result.value;
 
-    // Create PDF from HTML content using pdf-lib
+    // Convert DOCX to HTML using mammoth
+    let html = '';
+    try {
+      const result = await mammoth.convertToHtml({ buffer: bytes });
+      html = result.value || '';
+    } catch (e) {
+      html = '<p>Could not parse document content.</p>';
+    }
+
+    // Strip HTML tags for plain text
+    const textContent = html
+      .replace(/<br\s*\/?>/gi, '\n')
+      .replace(/<\/p>/gi, '\n\n')
+      .replace(/<\/h[1-6]>/gi, '\n\n')
+      .replace(/<\/li>/gi, '\n')
+      .replace(/<[^>]+>/g, '')
+      .replace(/&amp;/g, '&')
+      .replace(/&lt;/g, '<')
+      .replace(/&gt;/g, '>')
+      .replace(/&nbsp;/g, ' ')
+      .replace(/&quot;/g, '"')
+      .replace(/&#39;/g, "'")
+      .trim();
+
     const pdfDoc = await PDFDocument.create();
     const font = await pdfDoc.embedFont(StandardFonts.Helvetica);
-    const boldFont = await pdfDoc.embedFont(StandardFonts.HelveticaBold);
-    
-    // Strip HTML tags for text content
-    const textContent = html.replace(/<br\s*\/?>/gi, '\n')
-                            .replace(/<\/p>/gi, '\n\n')
-                            .replace(/<\/h[1-6]>/gi, '\n\n')
-                            .replace(/<[^>]+>/g, '')
-                            .replace(/&amp;/g, '&')
-                            .replace(/&lt;/g, '<')
-                            .replace(/&gt;/g, '>')
-                            .replace(/&nbsp;/g, ' ')
-                            .replace(/&quot;/g, '"');
-
-    const lines = textContent.split('\n');
     const fontSize = 11;
     const lineHeight = 16;
     const margin = 60;
     const pageWidth = 612;
     const pageHeight = 792;
     const usableWidth = pageWidth - margin * 2;
-    const maxLines = Math.floor((pageHeight - margin * 2) / lineHeight);
 
     let page = pdfDoc.addPage([pageWidth, pageHeight]);
     let yPos = pageHeight - margin;
-    let lineCount = 0;
 
-    const wrapText = (text, maxWidth, fnt, size) => {
+    const wrapText = (text) => {
+      if (!text.trim()) return [''];
       const words = text.split(' ');
-      const wrappedLines = [];
-      let currentLine = '';
+      const lines = [];
+      let current = '';
       for (const word of words) {
-        const testLine = currentLine ? `${currentLine} ${word}` : word;
-        const width = fnt.widthOfTextAtSize(testLine, size);
-        if (width > maxWidth && currentLine) {
-          wrappedLines.push(currentLine);
-          currentLine = word;
-        } else {
-          currentLine = testLine;
-        }
+        const test = current ? `${current} ${word}` : word;
+        try {
+          if (font.widthOfTextAtSize(test, fontSize) > usableWidth && current) {
+            lines.push(current);
+            current = word;
+          } else {
+            current = test;
+          }
+        } catch { current = test; }
       }
-      if (currentLine) wrappedLines.push(currentLine);
-      return wrappedLines;
+      if (current) lines.push(current);
+      return lines.length ? lines : [''];
     };
 
-    for (const rawLine of lines) {
-      const line = rawLine.trim();
-      if (!line) {
-        yPos -= lineHeight * 0.5;
-        lineCount++;
-        continue;
-      }
-      const wrapped = wrapText(line, usableWidth, font, fontSize);
+    // If no text content, add a placeholder page
+    const allLines = textContent ? textContent.split('\n') : ['(Empty document)'];
+
+    for (const rawLine of allLines) {
+      const wrapped = wrapText(rawLine.trim());
       for (const wl of wrapped) {
         if (yPos < margin + lineHeight) {
           page = pdfDoc.addPage([pageWidth, pageHeight]);
           yPos = pageHeight - margin;
         }
-        try {
-          page.drawText(wl, { x: margin, y: yPos, size: fontSize, font, color: rgb(0, 0, 0) });
-        } catch {}
-        yPos -= lineHeight;
+        if (wl.trim()) {
+          try {
+            // Replace any characters that can't be encoded
+            const safeLine = wl.replace(/[^\x00-\x7F]/g, '?');
+            page.drawText(safeLine, { x: margin, y: yPos, size: fontSize, font, color: rgb(0, 0, 0) });
+          } catch { /* skip unencodable line */ }
+        }
+        yPos -= wl.trim() ? lineHeight : lineHeight * 0.5;
       }
     }
 
